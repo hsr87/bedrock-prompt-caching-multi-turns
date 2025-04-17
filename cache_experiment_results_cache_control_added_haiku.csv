@@ -1,0 +1,11 @@
+experiment,turn,question,input_tokens,output_tokens,cache_creation_input_tokens,cache_read_input_tokens,invocation_latency
+1,1,Please summarize the storyline of the play.,1975,256,0,0,9.506325483322144
+1,2,Who are the main characters in the tragedy?,4,256,2243,0,6.118502616882324
+1,3,Why are the Montagues and Capulets in conflict with each other?,4,256,280,2243,7.4094767570495605
+1,4,What role does the Nurse play in Juliet's life?,4,256,278,2523,5.293642997741699
+1,5,How does Romeo respond after killing Tybalt?,4,256,272,2801,7.079281330108643
+1,6,What advice does Friar Lawrence give to Romeo after his banishment?,4,256,278,3073,5.444433689117432
+1,7,Why does Paris visit the Capulet tomb in the final scene?,4,247,279,3351,7.265205144882202
+1,8,What message fails to reach Romeo and what are the consequences?,4,231,263,3630,6.106431722640991
+1,9,How do the parents react to finding their children dead?,4,256,246,3893,8.062304496765137
+1,10,What reconciliation occurs between the families at the end of the play?,4,256,277,4139,9.597876787185669
