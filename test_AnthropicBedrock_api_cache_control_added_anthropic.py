@@ -1,9 +1,10 @@
 import time
-import boto3
 import json
 import os
 import pandas as pd
 from anthropic import Anthropic
+from functools import wraps
+import random 
 
 # Initialize Anthropic client
 client = Anthropic(api_key="YOUR_API_KEY")
@@ -11,10 +12,88 @@ client = Anthropic(api_key="YOUR_API_KEY")
 with open('RomeoAndJuliet.txt', 'r') as file: 
     sample_text = file.read()
 
-all_experiments_data = []
+result_dir = "37_250627_1p_ttft"
+if not os.path.exists(result_dir):
+    os.makedirs(result_dir)
     
-n_experiments = 1
+n_experiments = 10
 n_turns = 10
+
+def retry_with_exponential_backoff(
+    max_retries=5,
+    initial_delay=2,
+    exponential_base=2,
+    jitter=True
+):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            num_retries = 0
+            delay = initial_delay
+
+            while True:
+                try:
+                    return func(*args, **kwargs)
+
+                except Exception as e:
+                    num_retries += 1
+                    if num_retries > max_retries:
+                        raise e
+
+                    delay *= exponential_base
+                    if jitter:
+                        delay *= (0.5 + random.random())
+
+                    time.sleep(delay)
+
+        return wrapper
+    return decorator
+
+@retry_with_exponential_backoff()
+def anthropic_model_with_ttft(model_id, messages):
+    start_time = time.time()
+    ttft = None
+    full_response = ""
+    usage_data = {}
+    
+    # 스트리밍으로 메시지 생성
+    with client.messages.stream(
+        model=model_id,
+        max_tokens=256,
+        temperature=0.7,
+        system="You are a helpful assistant that answers questions concisely.",
+        messages=messages,
+    ) as stream:
+        for event in stream:
+            # content_block_start 이벤트에서 TTFT 측정
+            if event.type == "content_block_start":
+                if ttft is None:
+                    ttft = time.time() - start_time
+            
+            # text_delta 이벤트에서 텍스트 수집
+            elif event.type == "content_block_delta":
+                if hasattr(event.delta, 'text'):
+                    full_response += event.delta.text
+            
+            # message_delta 이벤트에서 usage 정보 수집
+            elif event.type == "message_delta":
+                if hasattr(event, 'usage'):
+                    usage_data = event.usage
+        
+        # 스트림이 끝나면 최종 메시지에서 전체 usage 정보 가져오기
+        final_message = stream.get_final_message()
+        if hasattr(final_message, 'usage'):
+            usage_data = {
+                "input_tokens": final_message.usage.input_tokens,
+                "output_tokens": final_message.usage.output_tokens,
+                "cache_creation_input_tokens": getattr(final_message.usage, 'cache_creation_input_tokens', 0),
+                "cache_read_input_tokens": getattr(final_message.usage, 'cache_read_input_tokens', 0)
+            }
+    
+    end_time = time.time()
+    total_latency = end_time - start_time
+    
+    return full_response, usage_data, ttft, total_latency
     
 # Helper function to remove cache_control from a message
 def remove_cache_control(message):
@@ -33,7 +112,10 @@ def remove_cache_control(message):
         message["content"] = new_content
     return message
 
+
 for exp_num in range(n_experiments): 
+    
+    all_experiments_data = []
     print(f"Running experiment {exp_num+1}/{n_experiments}")
     
     # We'll use different questions for each turn to simulate a real conversation
@@ -107,22 +189,14 @@ for exp_num in range(n_experiments):
     
         messages.append(current_message)
     
-        # Make the API call
-        start_time = time.time()
-        response = client.messages.create(
-            model="claude-3-7-sonnet-20250219",
-            max_tokens=256,
-            temperature=0.7,
-            system=[
-                {
-                    "type": "text", 
-                    "text": "You are a helpful assistant that answers questions concisely."
-                }
-            ],
-            messages=messages
+        # Make the API call with TTFT measurement
+        print(f"-------------{turn}-------------")
+        print(messages)
+        
+        full_response, metrics, ttft, invocation_latency = anthropic_model_with_ttft(
+            model_id="claude-3-7-sonnet-20250219",  # 또는 "claude-3-haiku-20240307" 등
+            messages=messages,
         )
-        end_time = time.time()
-        invocation_latency = end_time - start_time
         
         # Update conversation history with message containing cache_control
         conversation.append(current_message)
@@ -134,30 +208,27 @@ for exp_num in range(n_experiments):
             "content": [
                 {
                     "type": "text",
-                    "text": response.content[0].text
+                    "text": full_response,
                 }
             ]
         })
-    
-        # Get metrics
-        metrics = response.usage
     
         # Store data for this turn
         turn_data = {
             "experiment": exp_num + 1,
             "turn": turn + 1,
             "question": questions[turn],
-            "input_tokens": metrics.input_tokens,
-            "output_tokens": metrics.output_tokens,
-            "cache_creation_input_tokens": metrics.cache_creation_input_tokens or 0,
-            "cache_read_input_tokens": metrics.cache_read_input_tokens or 0,
-            "invocation_latency": invocation_latency
+            "input_tokens": metrics.get("input_tokens", 0),
+            "output_tokens": metrics.get("output_tokens", 0),
+            "cache_creation_input_tokens": metrics.get("cache_creation_input_tokens", 0),
+            "cache_read_input_tokens": metrics.get("cache_read_input_tokens", 0),
+            "invocation_latency": invocation_latency,
+            "ttft": ttft  
         }
-    
+        print(turn_data)
         experiment_data.append(turn_data)
-        
+
     all_experiments_data.extend(experiment_data)
 
-
-# Convert to DataFrame and save
-pd.DataFrame(all_experiments_data).to_csv("cache_experiment_results_cache_control_added_anthropic.csv", index=False)
+    # Convert to DataFrame and save
+    pd.DataFrame(all_experiments_data).to_csv(f"{result_dir}/cache_experiment_results_cache_control_added_test_{exp_num}.csv", index=False)

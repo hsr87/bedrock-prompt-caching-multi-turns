@@ -4,17 +4,96 @@ import json
 import os
 import pandas as pd
 from anthropic import AnthropicBedrock
+from functools import wraps
+import random 
 
-# Initialize Anthropic client
-client = AnthropicBedrock()
+# Initialize AnthropicBedrock client
+client = AnthropicBedrock(aws_region="us-west-2")
 
 with open('RomeoAndJuliet.txt', 'r') as file: 
     sample_text = file.read()
 
-all_experiments_data = []
+result_dir = "37_250630_ttft"
+if not os.path.exists(result_dir):
+    os.makedirs(result_dir)
     
-n_experiments = 1
+n_experiments = 10
 n_turns = 10
+
+def retry_with_exponential_backoff(
+    max_retries=5,
+    initial_delay=2,
+    exponential_base=2,
+    jitter=True
+):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            num_retries = 0
+            delay = initial_delay
+
+            while True:
+                try:
+                    return func(*args, **kwargs)
+
+                except Exception as e:
+                    num_retries += 1
+                    if num_retries > max_retries:
+                        raise e
+
+                    delay *= exponential_base
+                    if jitter:
+                        delay *= (0.5 + random.random())
+
+                    time.sleep(delay)
+
+        return wrapper
+    return decorator
+
+# 재시도 로직을 제거한 순수 API 호출 함수
+def anthropic_bedrock_model_api_call(model_id, messages):
+    start_time = time.time()
+    ttft = None
+    full_response = ""
+    
+    stream = client.messages.create(
+        model=model_id,
+        max_tokens=256,
+        temperature=0.7,
+        system=[
+            {
+                "type": "text", 
+                "text": "You are a helpful assistant that answers questions concisely."
+            }
+        ],
+        messages=messages,
+        stream=True  # Streaming
+    )
+    for event in stream:
+        if event.type == "content_block_start":
+            # TTFT
+            if ttft is None:
+                ttft = time.time() - start_time
+        
+        elif event.type == "content_block_delta":
+            # Txt
+            if hasattr(event.delta, 'text'):
+                full_response += event.delta.text
+        
+        elif event.type == "message_stop":
+            # usage
+            usage_data = getattr(event, 'amazon-bedrock-invocationMetrics')
+    
+    end_time = time.time()
+    total_latency = end_time - start_time
+    
+    return full_response, usage_data, ttft, total_latency
+
+# 재시도 로직을 적용한 래퍼 함수
+@retry_with_exponential_backoff()
+def anthropic_bedrock_model_with_ttft(model_id, messages):
+    # 재시도 로직과 관계없이 실제 API 호출 시간만 측정
+    return anthropic_bedrock_model_api_call(model_id, messages)
     
 # Helper function to remove cache_control from a message
 def remove_cache_control(message):
@@ -33,7 +112,10 @@ def remove_cache_control(message):
         message["content"] = new_content
     return message
 
+
 for exp_num in range(n_experiments): 
+    
+    all_experiments_data = []
     print(f"Running experiment {exp_num+1}/{n_experiments}")
     
     # We'll use different questions for each turn to simulate a real conversation
@@ -107,22 +189,14 @@ for exp_num in range(n_experiments):
     
         messages.append(current_message)
     
-        # Make the API call
-        start_time = time.time()
-        response = client.messages.create(
-            model="us.anthropic.claude-3-7-sonnet-20250219-v1:0",
-            max_tokens=256,
-            temperature=0.7,
-            system=[
-                {
-                    "type": "text", 
-                    "text": "You are a helpful assistant that answers questions concisely."
-                }
-            ],
-            messages=messages
+        # Make the API call with TTFT measurement
+        print(f"-------------{turn}-------------")
+        print(messages)
+        
+        full_response, metrics, ttft, invocation_latency = anthropic_bedrock_model_with_ttft(
+            model_id="us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+            messages=messages,
         )
-        end_time = time.time()
-        invocation_latency = end_time - start_time
         
         # Update conversation history with message containing cache_control
         conversation.append(current_message)
@@ -134,31 +208,29 @@ for exp_num in range(n_experiments):
             "content": [
                 {
                     "type": "text",
-                    "text": response.content[0].text
+                    "text": full_response,
                 }
             ]
         })
-    
-        # Get metrics
-        metrics = response.usage
     
         # Store data for this turn
         turn_data = {
             "experiment": exp_num + 1,
             "turn": turn + 1,
             "question": questions[turn],
-            "input_tokens": metrics.input_tokens,
-            "output_tokens": metrics.output_tokens,
-            "cache_creation_input_tokens": metrics.cache_creation_input_tokens or 0,
-            "cache_read_input_tokens": metrics.cache_read_input_tokens or 0,
-            "invocation_latency": invocation_latency
+            "input_tokens": metrics["inputTokenCount"],
+            "output_tokens": metrics["outputTokenCount"],
+            "cache_creation_input_tokens": metrics["cacheWriteInputTokenCount"] or 0,
+            "cache_read_input_tokens": metrics["cacheReadInputTokenCount"] or 0,
+            "invocation_latency": invocation_latency,
+            "invocation_latency_bedrock": metrics["invocationLatency"],
+            "first_byte_latency": metrics["firstByteLatency"],
+            "ttft": ttft  
         }
         print(turn_data)
         experiment_data.append(turn_data)
-        time.sleep(70)
-    
+
     all_experiments_data.extend(experiment_data)
 
-
-# Convert to DataFrame and save
-pd.DataFrame(all_experiments_data).to_csv("cache_experiment_results_cache_control_added.csv", index=False)
+    # Convert to DataFrame and save
+    pd.DataFrame(all_experiments_data).to_csv(f"{result_dir}/cache_experiment_results_cache_control_added_test_{exp_num}.csv", index=False)
